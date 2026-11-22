@@ -1,0 +1,16 @@
+build/
+*.nro
+*.nso
+*.nsp
+*.elf
+*.map
+*.lst
+*.o
+*.d
+.vscode/
+zzz.txt
+log.txt
+config.ini
+history.txt
+positions.txt
+*.mp4
