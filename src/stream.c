@@ -148,9 +148,14 @@ static void conn_close(conn_t *c)
 static int conn_raw_read(conn_t *c, unsigned char *buf, size_t len)
 {
     int ret;
+    int64_t start = snow(c->owner);
     do {
         ret = c->tls ? mbedtls_ssl_read(&c->ssl, buf, len)
                      : mbedtls_net_recv(&c->net, buf, len);
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ ||
+             ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            snow(c->owner) - start > 25000000)
+            return MBEDTLS_ERR_NET_RECV_FAILED;
     } while (ret == MBEDTLS_ERR_SSL_WANT_READ ||
              ret == MBEDTLS_ERR_SSL_WANT_WRITE);
     return ret;
@@ -304,8 +309,16 @@ static int conn_open(stream_t *s, conn_t *c, uint64_t off,
             while ((ret = mbedtls_ssl_handshake(&c->ssl)) != 0) {
                 if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                     ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                    snprintf(err, errcap, "TLS handshake failed (-0x%04x)",
-                             (unsigned)-ret);
+                    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                        unsigned vr = mbedtls_ssl_get_verify_result(&c->ssl);
+                        snprintf(err, errcap, "TLS certificate verification "
+                                 "failed (flags=0x%x, check console clock)", vr);
+                        applog("tls: stream cert verify failed host=%s flags=0x%x",
+                               host, vr);
+                    } else {
+                        snprintf(err, errcap, "TLS handshake failed (-0x%04x)",
+                                 (unsigned)-ret);
+                    }
                     conn_close(c);
                     return -1;
                 }
@@ -922,10 +935,18 @@ void stream_resume(stream_t *s)
         return;
     pthread_mutex_lock(&s->mu);
     if (s->suspended) {
-        s->time_shift_us += av_gettime() - s->suspend_start_us;
+        int64_t slept = av_gettime() - s->suspend_start_us;
+        s->time_shift_us += slept;
         s->suspended = 0;
         s->last_data_us = snow(s);
         applog("stream: resume shift=%lld ms", (long long)(s->time_shift_us / 1000));
+        /* After sleep the TCP connection is usually dead.  Nudge it so the
+         * downloader reconnects at its current offset instead of waiting for
+         * a timeout. */
+        if (slept > 2000000 && s->fd >= 0) {
+            applog("stream: dropping stale connection after sleep");
+            shutdown(s->fd, SHUT_RDWR);
+        }
         pthread_cond_broadcast(&s->cond);
     }
     pthread_mutex_unlock(&s->mu);

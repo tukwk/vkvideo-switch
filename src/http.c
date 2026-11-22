@@ -152,8 +152,14 @@ static int conn_open(conn_t *c, const url_t *u, char *err, size_t errcap)
         while ((ret = mbedtls_ssl_handshake(&c->ssl)) != 0) {
             if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                 ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                snprintf(err, errcap, "TLS handshake failed (-0x%04x)",
-                         (unsigned)-ret);
+                if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                    unsigned vr = mbedtls_ssl_get_verify_result(&c->ssl);
+                    snprintf(err, errcap, "TLS certificate verification "
+                             "failed (flags=0x%x, check console clock)", vr);
+                } else {
+                    snprintf(err, errcap, "TLS handshake failed (-0x%04x)",
+                             (unsigned)-ret);
+                }
                 mbedtls_net_free(&c->net);
                 mbedtls_ssl_free(&c->ssl);
                 return -1;

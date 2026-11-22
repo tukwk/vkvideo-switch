@@ -6,16 +6,28 @@
 #include <switch.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+
+#include "cacert_bin.h"
+#include "log.h"
 
 static mbedtls_entropy_context  g_entropy;
 static mbedtls_ctr_drbg_context g_drbg;
 static mbedtls_ssl_config       g_conf;
+static mbedtls_x509_crt         g_ca;
+static int g_ca_ready;
 static int g_ready;
 
 int net_init(void)
@@ -31,6 +43,26 @@ int net_init(void)
     mbedtls_entropy_init(&g_entropy);
     mbedtls_ctr_drbg_init(&g_drbg);
     mbedtls_ssl_config_init(&g_conf);
+    mbedtls_x509_crt_init(&g_ca);
+
+    /* bin2o data is not NUL-terminated; mbedTLS wants a terminated PEM. */
+    unsigned char *pem = malloc((size_t)cacert_bin_size + 1);
+    if (!pem) {
+        applog("tls: out of memory (ca)");
+        return -1;
+    }
+    memcpy(pem, cacert_bin, cacert_bin_size);
+    pem[cacert_bin_size] = '\0';
+    ret = mbedtls_x509_crt_parse(&g_ca, pem, (size_t)cacert_bin_size + 1);
+    free(pem);
+    if (ret < 0) {
+        applog("tls: ca parse failed -0x%04x", (unsigned)-ret);
+        mbedtls_x509_crt_free(&g_ca);
+        return -1;
+    }
+    if (ret > 0)
+        applog("tls: ca warnings, %d cert(s) skipped", ret);
+    g_ca_ready = 1;
 
     ret = mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
                                 (const unsigned char *)pers, sizeof(pers) - 1);
@@ -43,11 +75,14 @@ int net_init(void)
     if (ret != 0)
         return -1;
 
-    /* TODO(v0.2): pin a CA bundle instead of disabling verification. */
-    mbedtls_ssl_conf_authmode(&g_conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_ca_chain(&g_conf, &g_ca, NULL);
+    mbedtls_ssl_conf_authmode(&g_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     mbedtls_ssl_conf_rng(&g_conf, mbedtls_ctr_drbg_random, &g_drbg);
 
+    /* mbedTLS checks certificate validity, so the console clock must be
+     * sane. libnx newlib initialises it from TimeType at startup. */
     g_ready = 1;
+    applog("tls: CA bundle loaded (%u bytes)", (unsigned)cacert_bin_size);
     return 0;
 }
 
@@ -61,10 +96,79 @@ void net_exit(void)
     if (!g_ready)
         return;
     mbedtls_ssl_config_free(&g_conf);
+    if (g_ca_ready)
+        mbedtls_x509_crt_free(&g_ca);
+    g_ca_ready = 0;
     mbedtls_ctr_drbg_free(&g_drbg);
     mbedtls_entropy_free(&g_entropy);
     csrngExit();
     g_ready = 0;
+}
+
+/* IPv4-only connect with timeout.  The Switch often has broken IPv6 routes,
+ * and after sleep getaddrinfo may order results differently, so we do not
+ * let mbedTLS pick an address. */
+static int tcp_open(const char *host, const char *port, int *out_fd,
+                    char *err, size_t errcap)
+{
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0 || !res) {
+        snprintf(err, errcap, "DNS %s failed (%d)", host, rc);
+        return -1;
+    }
+
+    int last_errno = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+        int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r < 0 && errno == EINPROGRESS) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(fd, &wf);
+            struct timeval tv = { .tv_sec = 6, .tv_usec = 0 };
+            r = select(fd + 1, NULL, &wf, NULL, &tv);
+            if (r <= 0) {
+                last_errno = (r == 0) ? ETIMEDOUT : errno;
+                close(fd);
+                continue;
+            }
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0)
+                soerr = errno;
+            if (soerr != 0) {
+                last_errno = soerr;
+                close(fd);
+                continue;
+            }
+            r = 0;
+        }
+        if (r < 0) {
+            last_errno = errno;
+            close(fd);
+            continue;
+        }
+        fcntl(fd, F_SETFL, fl);
+        *out_fd = fd;
+        freeaddrinfo(res);
+        return 0;
+    }
+
+    freeaddrinfo(res);
+    snprintf(err, errcap, "connect %s:%s failed errno=%d", host, port, last_errno);
+    return -1;
 }
 
 static int read_response(mbedtls_ssl_context *ssl, char *out, size_t cap,
@@ -137,11 +241,17 @@ int net_https_get(const char *host, const char *path,
     mbedtls_net_init(&server);
     mbedtls_ssl_init(&ssl);
 
-    ret = mbedtls_net_connect(&server, host, "443", MBEDTLS_NET_PROTO_TCP);
-    if (ret != 0) {
-        snprintf(err, errcap, "connect %s: -0x%04x", host, (unsigned)-ret);
-        goto out;
+    int fd = -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (tcp_open(host, "443", &fd, err, errcap) == 0)
+            break;
+        applog("net: %s (attempt %d/3)", err, attempt + 1);
+        if (attempt < 2)
+            svcSleepThread(500000000ULL);
     }
+    if (fd < 0)
+        goto out;
+    server.fd = fd;
 
     ret = mbedtls_ssl_setup(&ssl, &g_conf);
     if (ret != 0) {
@@ -154,7 +264,15 @@ int net_https_get(const char *host, const char *path,
 
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            snprintf(err, errcap, "handshake: -0x%04x", (unsigned)-ret);
+            unsigned vr = mbedtls_ssl_get_verify_result(&ssl);
+            if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                snprintf(err, errcap, "TLS certificate verification failed "
+                         "(flags=0x%x, check console clock)", vr);
+            } else {
+                snprintf(err, errcap, "handshake: -0x%04x", (unsigned)-ret);
+            }
+            applog("tls: host=%s verify=0x%x ret=-0x%04x",
+                   host, vr, (unsigned)-ret);
             goto out;
         }
     }

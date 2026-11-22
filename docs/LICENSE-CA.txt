@@ -1,0 +1,11 @@
+CA certificate bundle
+=====================
+
+data/cacert.bin is the Mozilla CA root certificate bundle as published at
+https://curl.se/ca/cacert.pem
+
+The bundle is generated from the Mozilla CA database. The certificate data is
+distributed under the Mozilla Public License 2.0 (MPL 2.0):
+https://www.mozilla.org/MPL/2.0/
+
+It is refreshed with tools/update-ca.sh.

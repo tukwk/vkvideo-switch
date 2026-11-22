@@ -13,7 +13,7 @@ INCLUDES := src
 
 APP_TITLE   := VK Video
 APP_AUTHOR  := vkvideo-switch
-APP_VERSION := 0.3.0
+APP_VERSION := 0.4.1
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -fPIC
 

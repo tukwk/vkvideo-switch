@@ -71,6 +71,7 @@ typedef struct {
     u64 last_video_us;
     double audio_base;
     double trim_until;
+    int seek_pending;
     double last_ac;
     u64 last_ac_us;
     float volume;
@@ -243,6 +244,8 @@ static void audio_emit(player_t *p, AVFrame *frame, u8 **abuf, int *cap)
         got -= skip;
         memmove(*abuf, *abuf + (size_t)skip * 4, (size_t)got * 4);
     }
+    if (p->seek_pending)
+        return; /* wait for the first video frame after seek */
     audio_feed(*abuf, (u32)got * 4);
 }
 
@@ -519,6 +522,7 @@ static void enqueue_decoded(player_t *p, AVFrame *src, AVFrame **vq,
         av_frame_free(&copy);
         return;
     }
+    p->seek_pending = 0;
 
     if (*vq_len >= VQ_MAX) {
         if (pts >= 0 && pts > p->pos + 0.5) {
@@ -572,6 +576,7 @@ static void seek_to(player_t *p, double target)
     p->pos = target;
     p->vbase = target;
     p->trim_until = target;
+    p->seek_pending = 1;
     p->last_ac = target;
     p->last_ac_us = 0;
     audio_reset(p);
@@ -848,6 +853,7 @@ int player_play(const char *url, const char *title, double start_pos,
 
     if (start_pos > 0.5) {
         p.trim_until = start_pos;
+        p.seek_pending = 1;
         int64_t ts = (int64_t)(start_pos / av_q2d(p.vtb));
         int sr = av_seek_frame(p.fmt, p.vindex, ts, AVSEEK_FLAG_BACKWARD);
         applog("player: start seek %.2f ts=%lld r=%d", start_pos, (long long)ts, sr);
@@ -868,9 +874,10 @@ int player_play(const char *url, const char *title, double start_pos,
     p.buffering = 1;
     present_status(&p, "Буферизация...");
 
-    /* Prefill a few packets. */
-    for (int guard = 0; guard < 300 && !eof; guard++) {
-        if (vq_len > 0 && s_pending >= (u32)(s_rate / 2))
+    /* Prefill until the decoder reaches the seek target, so the clock never
+     * starts ahead of the first visible frame. */
+    for (int guard = 0; guard < 3000 && !eof; guard++) {
+        if (vq_len > 0 && s_pending >= (u32)(s_rate / 4))
             break;
         int rr = av_read_frame(p.fmt, pkt);
         if (rr < 0) {
@@ -933,7 +940,7 @@ int player_play(const char *url, const char *title, double start_pos,
 
     for (;;) {
         if (!appletMainLoop()) {
-            if (appletGetFocusState() == AppletFocusState_Background) {
+            if (appletGetFocusState() != AppletFocusState_InFocus) {
                 if (!p.paused) {
                     p.paused = 1;
                     audio_reset(&p);
@@ -941,6 +948,7 @@ int player_play(const char *url, const char *title, double start_pos,
                 stream_suspend(p.stream);
                 was_bg = 1;
                 p.last_us = av_gettime();
+                applog("player: sleep, paused at %.1f", p.pos);
                 present_status(&p, "Пауза (сон)");
                 svcSleepThread(100000000ULL);
                 continue;
@@ -965,6 +973,7 @@ int player_play(const char *url, const char *title, double start_pos,
             continue;
         } else if (was_bg) {
             was_bg = 0;
+            applog("player: wake, resuming at %.1f", p.pos);
             stream_resume(p.stream);
             p.paused = 0;
             p.last_us = av_gettime();
@@ -1038,10 +1047,14 @@ int player_play(const char *url, const char *title, double start_pos,
         if (p.msg[0] && now > p.osd_until)
             p.msg[0] = '\0';
 
-        int starving = (!eof && vq_len == 0 &&
+        int starving = (!eof && !p.seek_pending && vq_len == 0 &&
                         now - p.last_video_us > 500000);
         if (!p.paused) {
-            if (starving) {
+            if (p.seek_pending) {
+                p.last_us = now;
+                if (now - p.last_present > 33000)
+                    present_loading(&p, now / 1000, "Перемотка...");
+            } else if (starving) {
                 p.last_us = now;
                 if (!p.starving) {
                     p.starving = 1;
@@ -1180,7 +1193,8 @@ int player_play(const char *url, const char *title, double start_pos,
 
         /* Watchdog: if the picture has been stuck for several seconds,
          * re-seek to the current position to rebuild the pipeline. */
-        if (!p.paused && !eof && now - p.last_video_us > 6000000 &&
+        if (!p.paused && !p.seek_pending && !eof &&
+            now - p.last_video_us > 6000000 &&
             now - last_watchdog > 5000000 &&
             (vq_len == 0 || vq_pts[0] > p.pos + 2.0)) {
             applog("player: watchdog stall pos=%.1f vq=%d",

@@ -57,6 +57,9 @@ make -j$(nproc)
 Требования: `git`, `curl`, `python3`, `make`, `cc`, `dpkg-deb` (для `lz4.h`,
 если его нет в системе).
 
+CA-бандл (`data/cacert.bin`) взят из <https://curl.se/ca/cacert.pem>
+(Mozilla CA store). Обновить: `./tools/update-ca.sh`.
+
 UI-зависимости вендорены в репозиторий и не требуют отдельных пакетов:
 `stb_image`, `stb_truetype` и шрифт `data/font.bin` (DejaVu Sans, лицензия в
 `docs/LICENSE-DejaVu.txt`).

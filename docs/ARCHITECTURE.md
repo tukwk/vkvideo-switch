@@ -75,8 +75,10 @@ GET https://api.vk.com/method/video.get
 
 ## Сеть и стрим
 
-- `net.c` — HTTPS GET для API, TLS 1.2/1.3, SNI, ответ в буфер.
-  Проверка сертификата пока отключена (`MBEDTLS_SSL_VERIFY_NONE`).
+- `net.c` — HTTPS GET для API, TLS 1.2, SNI, ответ в буфер.
+  Сертификаты проверяются: `MBEDTLS_SSL_VERIFY_REQUIRED` + CA-бандл
+  Mozilla в `data/cacert.bin` (вшивается в NRO через bin2o). Проверка
+  валидности использует часы консоли; при сбитом времени TLS не пройдёт.
 - `http.c` — HTTP-клиент: `HTTP/1.0`, до 5 редиректов,
   `http_get_mem` для картинок (лимит 3 МБ).
 - `stream.c` — прогрессивный стрим видео:
