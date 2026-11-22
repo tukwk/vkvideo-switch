@@ -43,7 +43,7 @@ Homebrew-клиент VK Видео для прошитой Nintendo Switch (Atm
 
 1. Открой <https://vkhost.github.io/>.
 2. Выбери VK, разреши доступ к видео.
-3. Скопируй `access_token` из адресной строки/страницы(полную ссылку копировать не надо,только токен,oauth.vk.ru/blank.html#access_token= ТОКЕН! &expires_in=####&user_id=#######&email=example@gmail.com.)
+3. Скопируй `access_token` из адресной строки/страницы(полную ссылку копировать не надо,только токен,oauth.vk.ru/blank.html#access_token= ТОКЕН! &expires_in=####&user_id=#######&email=#######)
 
 Дальше токен можно добавить двумя способами.
 
